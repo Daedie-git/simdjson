@@ -77,6 +77,26 @@ namespace simdjson {
 namespace SIMDJSON_IMPLEMENTATION {
 namespace builder {
 
+// Storage policy implementations (see json_string_builder.h)
+simdjson_inline owning_storage::owning_storage(size_t initial_capacity) noexcept {
+  if (initial_capacity == 0) { return; }
+  std::unique_ptr<char[]> ptr(new (std::nothrow) char[initial_capacity]);
+  if (!ptr) { cap = 0; buffer.reset(); return; }
+  cap = initial_capacity;
+  buffer.swap(ptr);
+}
+
+simdjson_inline bool owning_storage::grow(size_t desired_capacity, size_t bytes_to_copy) noexcept {
+  std::unique_ptr<char[]> new_buffer(new (std::nothrow) char[desired_capacity]);
+  if (!new_buffer) { return false; }
+  if (buffer && bytes_to_copy) {
+    std::memcpy(new_buffer.get(), buffer.get(), bytes_to_copy);
+  }
+  buffer.swap(new_buffer);
+  cap = desired_capacity;
+  return true;
+}
+
 static SIMDJSON_CONSTEXPR_LAMBDA std::array<uint8_t, 256>
     json_quotable_character = {
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -484,16 +504,14 @@ inline size_t write_string_escaped(const std::string_view input, char *out) {
   return out - initout;
 }
 
-simdjson_inline string_builder::string_builder(size_t initial_capacity)
-    : buffer(new(std::nothrow) char[initial_capacity]), position(0),
-      capacity(buffer.get() != nullptr ? initial_capacity : 0),
-      is_valid(buffer.get() != nullptr) {}
 
-simdjson_inline bool string_builder::capacity_check(size_t upcoming_bytes) {
+template <typename Storage>
+simdjson_inline bool string_builder_base<Storage>::capacity_check(size_t upcoming_bytes) {
   // We use the convention that when is_valid is false, then the capacity and
   // the position are 0.
   // Most of the time, this function will return true.
-  if (simdjson_likely(upcoming_bytes <= capacity - position)) {
+  const size_t cap = Storage::capacity();
+  if (simdjson_likely(upcoming_bytes <= cap - position)) {
     return true;
   }
   // check for overflow, most of the time there is no overflow
@@ -501,61 +519,60 @@ simdjson_inline bool string_builder::capacity_check(size_t upcoming_bytes) {
     return false;
   }
   // We will rarely get here.
-  grow_buffer((std::max)(capacity * 2, position + upcoming_bytes));
+  grow_buffer((std::max)(cap * 2, position + upcoming_bytes));
   // If the buffer allocation failed, we set is_valid to false.
   return is_valid;
 }
 
-simdjson_inline void string_builder::grow_buffer(size_t desired_capacity) {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::grow_buffer(size_t desired_capacity) {
   if (!is_valid) {
     return;
   }
-  std::unique_ptr<char[]> new_buffer(new (std::nothrow) char[desired_capacity]);
-  if (new_buffer.get() == nullptr) {
+  if (!Storage::grow(desired_capacity, position)) {
     set_valid(false);
-    return;
   }
-  std::memcpy(new_buffer.get(), buffer.get(), position);
-  buffer.swap(new_buffer);
-  capacity = desired_capacity;
 }
 
-simdjson_inline void string_builder::set_valid(bool valid) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::set_valid(bool valid) noexcept {
   if (!valid) {
     is_valid = false;
-    capacity = 0;
     position = 0;
-    buffer.reset();
+    Storage::invalidate();
   } else {
     is_valid = true;
   }
 }
 
-simdjson_inline size_t string_builder::size() const noexcept {
+template <typename Storage>
+simdjson_inline size_t string_builder_base<Storage>::size() const noexcept {
   return position;
 }
 
-simdjson_inline void string_builder::append(char c) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append(char c) noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = c;
+    Storage::data()[position++] = c;
   }
 }
 
-simdjson_inline void string_builder::append_null() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append_null() noexcept {
   constexpr char null_literal[] = "null";
   constexpr size_t null_len = sizeof(null_literal) - 1;
   if (capacity_check(null_len)) {
-    std::memcpy(buffer.get() + position, null_literal, null_len);
+    std::memcpy(Storage::data() + position, null_literal, null_len);
     position += null_len;
   }
 }
 
-simdjson_inline void string_builder::clear() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::clear() noexcept {
   position = 0;
   // if it was invalid, we should try to repair it
   if (!is_valid) {
-    capacity = 0;
-    buffer.reset();
+    Storage::invalidate();
     is_valid = true;
   }
 }
@@ -639,8 +656,9 @@ static const char decimal_table[200] = {
 };
 } // namespace internal
 
+template <typename Storage>
 template <typename number_type, typename>
-simdjson_inline void string_builder::append(number_type v) noexcept {
+simdjson_inline void string_builder_base<Storage>::append(number_type v) noexcept {
   static_assert(std::is_same<number_type, bool>::value ||
                     std::is_integral<number_type>::value ||
                     std::is_floating_point<number_type>::value,
@@ -651,14 +669,14 @@ simdjson_inline void string_builder::append(number_type v) noexcept {
       constexpr char true_literal[] = "true";
       constexpr size_t true_len = sizeof(true_literal) - 1;
       if (capacity_check(true_len)) {
-        std::memcpy(buffer.get() + position, true_literal, true_len);
+        std::memcpy(Storage::data() + position, true_literal, true_len);
         position += true_len;
       }
     } else {
       constexpr char false_literal[] = "false";
       constexpr size_t false_len = sizeof(false_literal) - 1;
       if (capacity_check(false_len)) {
-        std::memcpy(buffer.get() + position, false_literal, false_len);
+        std::memcpy(Storage::data() + position, false_literal, false_len);
         position += false_len;
       }
     }
@@ -671,7 +689,7 @@ simdjson_inline void string_builder::append(number_type v) noexcept {
       using unsigned_type = typename std::make_unsigned<number_type>::type;
       unsigned_type pv = static_cast<unsigned_type>(v);
       size_t dc = internal::digit_count(pv);
-      char *write_pointer = buffer.get() + position + dc - 1;
+      char *write_pointer = Storage::data() + position + dc - 1;
 
       // Process 4 digits per iteration for large numbers
       while (pv >= 10000) {
@@ -712,9 +730,9 @@ simdjson_inline void string_builder::append(number_type v) noexcept {
       }
       size_t dc = internal::digit_count(pv);
       // by always writing the minus sign, we avoid the branch.
-      buffer.get()[position] = '-';
+      Storage::data()[position] = '-';
       position += negative ? 1 : 0;
-      char *write_pointer = buffer.get() + position + dc - 1;
+      char *write_pointer = Storage::data() + position + dc - 1;
 
       // Process 4 digits per iteration for large numbers
       while (pv >= 10000) {
@@ -746,15 +764,15 @@ simdjson_inline void string_builder::append(number_type v) noexcept {
     constexpr size_t max_number_size = 24;
     if (capacity_check(max_number_size)) {
       // We could specialize for float.
-      char *end = simdjson::internal::to_chars(buffer.get() + position, nullptr,
+      char *end = simdjson::internal::to_chars(Storage::data() + position, nullptr,
                                                double(v));
-      position = end - buffer.get();
+      position = end - Storage::data();
     }
   }
 }
 
-simdjson_inline void
-string_builder::escape_and_append(std::string_view input) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::escape_and_append(std::string_view input) noexcept {
   // escaping might turn a control character into \x00xx so 6 characters.
   // Guard against size_t overflow in the multiplication below.
   if (input.size() > (std::numeric_limits<size_t>::max)() / 6) {
@@ -762,12 +780,12 @@ string_builder::escape_and_append(std::string_view input) noexcept {
     return;
   }
   if (capacity_check(6 * input.size())) {
-    position += write_string_escaped(input, buffer.get() + position);
+    position += write_string_escaped(input, Storage::data() + position);
   }
 }
 
-simdjson_inline void
-string_builder::escape_and_append_with_quotes(std::string_view input) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::escape_and_append_with_quotes(std::string_view input) noexcept {
   // escaping might turn a control character into \x00xx so 6 characters.
   // Guard against size_t overflow in the arithmetic below.
   if (input.size() > ((std::numeric_limits<size_t>::max)() - 2) / 6) {
@@ -775,60 +793,63 @@ string_builder::escape_and_append_with_quotes(std::string_view input) noexcept {
     return;
   }
   if (capacity_check(2 + 6 * input.size())) {
-    buffer.get()[position++] = '"';
-    position += write_string_escaped(input, buffer.get() + position);
-    buffer.get()[position++] = '"';
+    Storage::data()[position++] = '"';
+    position += write_string_escaped(input, Storage::data() + position);
+    Storage::data()[position++] = '"';
   }
 }
 
-simdjson_inline void
-string_builder::escape_and_append_with_quotes(char input) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::escape_and_append_with_quotes(char input) noexcept {
   // escaping might turn a control character into \x00xx so 6 characters.
   if (capacity_check(2 + 6 * 1)) {
-    buffer.get()[position++] = '"';
+    Storage::data()[position++] = '"';
     std::string_view cinput(&input, 1);
-    position += write_string_escaped(cinput, buffer.get() + position);
-    buffer.get()[position++] = '"';
+    position += write_string_escaped(cinput, Storage::data() + position);
+    Storage::data()[position++] = '"';
   }
 }
 
-simdjson_inline void
-string_builder::escape_and_append_with_quotes(const char *input) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::escape_and_append_with_quotes(const char *input) noexcept {
   std::string_view cinput(input);
   escape_and_append_with_quotes(cinput);
 }
 #if SIMDJSON_SUPPORTS_CONCEPTS
+template <typename Storage>
 template <constevalutil::fixed_string key>
-simdjson_inline void string_builder::escape_and_append_with_quotes() noexcept {
+simdjson_inline void string_builder_base<Storage>::escape_and_append_with_quotes() noexcept {
   escape_and_append_with_quotes(constevalutil::string_constant<key>::value);
 }
 #endif
 
-simdjson_inline void string_builder::append_raw(const char *c) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append_raw(const char *c) noexcept {
   size_t len = std::strlen(c);
   append_raw(c, len);
 }
 
-simdjson_inline void
-string_builder::append_raw(std::string_view input) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append_raw(std::string_view input) noexcept {
   if (capacity_check(input.size())) {
-    std::memcpy(buffer.get() + position, input.data(), input.size());
+    std::memcpy(Storage::data() + position, input.data(), input.size());
     position += input.size();
   }
 }
 
-simdjson_inline void string_builder::append_raw(const char *str,
-                                                size_t len) noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append_raw(const char *str, size_t len) noexcept {
   if (capacity_check(len)) {
-    std::memcpy(buffer.get() + position, str, len);
+    std::memcpy(Storage::data() + position, str, len);
     position += len;
   }
 }
 #if SIMDJSON_SUPPORTS_CONCEPTS
 // Support for optional types (std::optional, etc.)
+template <typename Storage>
 template <concepts::optional_type T>
   requires(!require_custom_serialization<T>)
-simdjson_inline void string_builder::append(const T &opt) {
+simdjson_inline void string_builder_base<Storage>::append(const T &opt) {
   if (opt) {
     append(*opt);
   } else {
@@ -842,19 +863,21 @@ simdjson_inline void string_builder::append(T &&val) {
   serialize(*this, std::forward<T>(val));
 }
 
+template <typename Storage>
 template <typename T>
   requires(std::is_convertible<T, std::string_view>::value ||
            std::is_same<T, const char *>::value)
-simdjson_inline void string_builder::append(const T &value) {
+simdjson_inline void string_builder_base<Storage>::append(const T &value) {
   escape_and_append_with_quotes(value);
 }
 #endif
 
 #if SIMDJSON_SUPPORTS_RANGES && SIMDJSON_SUPPORTS_CONCEPTS
 // Support for range-based appending (std::ranges::view, etc.)
+template <typename Storage>
 template <std::ranges::range R>
   requires(!std::is_convertible<R, std::string_view>::value && !require_custom_serialization<R>)
-simdjson_inline void string_builder::append(const R &range) noexcept {
+simdjson_inline void string_builder_base<Storage>::append(const R &range) noexcept {
   auto it = std::ranges::begin(range);
   auto end = std::ranges::end(range);
   if constexpr (concepts::is_pair<std::ranges::range_value_t<R>>) {
@@ -897,75 +920,86 @@ simdjson_inline void string_builder::append(const R &range) noexcept {
 #endif
 
 #if SIMDJSON_EXCEPTIONS
-simdjson_inline string_builder::operator std::string() const noexcept(false) {
+template <typename Storage>
+simdjson_inline string_builder_base<Storage>::operator std::string() const noexcept(false) {
   return std::string(operator std::string_view());
 }
 
-simdjson_inline string_builder::operator std::string_view() const
+template <typename Storage>
+simdjson_inline string_builder_base<Storage>::operator std::string_view() const
     noexcept(false) simdjson_lifetime_bound {
   return view();
 }
 #endif
 
+template <typename Storage>
 simdjson_inline simdjson_result<std::string_view>
-string_builder::view() const noexcept {
+string_builder_base<Storage>::view() const noexcept {
   if (!is_valid) {
     return simdjson::OUT_OF_CAPACITY;
   }
-  return std::string_view(buffer.get(), position);
+  return std::string_view(Storage::data(), position);
 }
 
-simdjson_inline simdjson_result<const char *> string_builder::c_str() noexcept {
+template <typename Storage>
+simdjson_inline simdjson_result<const char *> string_builder_base<Storage>::c_str() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position] = '\0';
-    return buffer.get();
+    Storage::data()[position] = '\0';
+    return Storage::data();
   }
   return simdjson::OUT_OF_CAPACITY;
 }
 
-simdjson_inline bool string_builder::validate_unicode() const noexcept {
-  return simdjson::validate_utf8(buffer.get(), position);
+template <typename Storage>
+simdjson_inline bool string_builder_base<Storage>::validate_unicode() const noexcept {
+  return simdjson::validate_utf8(Storage::data(), position);
 }
 
-simdjson_inline void string_builder::start_object() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::start_object() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = '{';
+    Storage::data()[position++] = '{';
   }
 }
 
-simdjson_inline void string_builder::end_object() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::end_object() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = '}';
+    Storage::data()[position++] = '}';
   }
 }
 
-simdjson_inline void string_builder::start_array() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::start_array() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = '[';
+    Storage::data()[position++] = '[';
   }
 }
 
-simdjson_inline void string_builder::end_array() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::end_array() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = ']';
+    Storage::data()[position++] = ']';
   }
 }
 
-simdjson_inline void string_builder::append_comma() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append_comma() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = ',';
+    Storage::data()[position++] = ',';
   }
 }
 
-simdjson_inline void string_builder::append_colon() noexcept {
+template <typename Storage>
+simdjson_inline void string_builder_base<Storage>::append_colon() noexcept {
   if (capacity_check(1)) {
-    buffer.get()[position++] = ':';
+    Storage::data()[position++] = ':';
   }
 }
 
+template <typename Storage>
 template <typename key_type, typename value_type>
-simdjson_inline void
-string_builder::append_key_value(key_type key, value_type value) noexcept {
+simdjson_inline void string_builder_base<Storage>::append_key_value(key_type key, value_type value) noexcept {
   static_assert(std::is_same<key_type, const char *>::value ||
                     std::is_convertible<key_type, std::string_view>::value,
                 "Unsupported key type");
@@ -990,9 +1024,9 @@ string_builder::append_key_value(key_type key, value_type value) noexcept {
 }
 
 #if SIMDJSON_SUPPORTS_CONCEPTS
-template <constevalutil::fixed_string key, typename value_type>
-simdjson_inline void
-string_builder::append_key_value(value_type value) noexcept {
+ template <typename Storage>
+ template <constevalutil::fixed_string key, typename value_type>
+ simdjson_inline void string_builder_base<Storage>::append_key_value(value_type value) noexcept {
   escape_and_append_with_quotes<key>();
   append_colon();
   SIMDJSON_IF_CONSTEXPR(std::is_same<value_type, std::nullptr_t>::value) {

@@ -39,6 +39,48 @@ struct has_custom_serialization : std::false_type {};
 
 namespace SIMDJSON_IMPLEMENTATION {
 namespace builder {
+
+struct owning_storage {
+  using container_type = std::unique_ptr<char[]>;
+    
+  simdjson_inline explicit owning_storage(size_t initial_capacity) noexcept;
+  simdjson_inline char *data() noexcept { return buffer.get(); }
+  simdjson_inline const char *data() const noexcept { return buffer.get(); }
+  simdjson_inline size_t capacity() const noexcept { return cap; }
+  simdjson_inline bool grow(size_t desired_capacity, size_t bytes_to_copy) noexcept;
+  simdjson_inline void invalidate() noexcept { buffer.reset(); cap = 0; }
+
+private:
+  std::unique_ptr<char[]> buffer = nullptr;
+  size_t cap{0};
+};
+
+template <typename Container>
+struct non_owning_storage {  
+  using container_type = Container;
+  using element_ptr = Container::pointer;
+  using value_type = Container::value_type;
+  static_assert(std::is_same_v<value_type, char> || std::is_same_v<value_type, unsigned char>, "Container::value_type must be a char type");
+
+  simdjson_inline explicit non_owning_storage(Container &ref) noexcept : container(ref) {}
+  simdjson_inline auto* data() noexcept { return container.data(); }
+  simdjson_inline const auto *data() const noexcept { return container.data(); }
+  simdjson_inline size_t capacity() const noexcept { return container.size(); }
+  simdjson_inline bool grow(size_t desired_capacity, size_t) noexcept {
+#if SIMDJSON_EXCEPTIONS
+    try { container.resize(desired_capacity); } catch (...) { return false; }
+    return true;
+#else
+    container.resize(desired_capacity);
+    return true;
+#endif
+  }
+  simdjson_inline void invalidate() noexcept { container.clear(); }
+
+private:
+  Container& container;
+};
+
 /**
  * A builder for JSON strings representing documents. This is a low-level
  * builder that is not meant to be used directly by end-users. Though it
@@ -48,11 +90,18 @@ namespace builder {
  * Ultimately, this class can support kernel-specific optimizations. E.g.,
  * it may make use of SIMD instructions to escape strings faster.
  */
-class string_builder {
+template <typename Storage>
+class string_builder_base : protected Storage {
 public:
-  simdjson_inline string_builder(size_t initial_capacity = DEFAULT_INITIAL_CAPACITY);
-
-  static constexpr size_t DEFAULT_INITIAL_CAPACITY = 1024;
+  simdjson_inline string_builder_base() noexcept = default;
+  template <typename... Args>
+  simdjson_inline explicit string_builder_base(size_t initial_capacity) noexcept
+  requires (std::is_constructible_v<Storage, size_t>)
+    : Storage(initial_capacity) {}
+  
+  simdjson_inline explicit string_builder_base(Storage::container_type& container) noexcept
+  requires (std::is_constructible_v<Storage, typename Storage::container_type&>)
+    : Storage(container) {}
 
   /**
    * Append number (includes Booleans). Booleans are mapped to the strings
@@ -158,10 +207,6 @@ public:
   requires(!require_custom_serialization<T>)
   simdjson_inline void append(const T &opt);
 
-  template <typename T>
-  requires(require_custom_serialization<T>)
-  simdjson_inline void append(T &&val);
-
   // Support for string-like types
   template <typename T>
   requires(std::is_convertible<T, std::string_view>::value ||
@@ -236,7 +281,7 @@ requires (!std::is_convertible<R, std::string_view>::value && !require_custom_se
    */
   simdjson_inline size_t size() const noexcept;
 
-private:
+protected:
   /**
    * Returns true if we can write at least upcoming_bytes bytes.
    * The underlying buffer is reallocated if needed. It is designed
@@ -256,10 +301,27 @@ private:
    */
   simdjson_inline void set_valid(bool valid) noexcept;
 
-  std::unique_ptr<char[]> buffer{};
   size_t position{0};
-  size_t capacity{0};
   bool is_valid{true};
+};
+
+class string_builder : public string_builder_base<owning_storage> {
+public:
+  using string_builder_base<owning_storage>::append;
+  static constexpr size_t DEFAULT_INITIAL_CAPACITY = 1024;
+  simdjson_inline string_builder(size_t initial_capacity = DEFAULT_INITIAL_CAPACITY)
+    : string_builder_base<owning_storage>(initial_capacity) {}
+
+  template <typename T>
+  requires(require_custom_serialization<T>)
+  simdjson_inline void append(T &&val);
+};
+
+template <typename Container>
+class string_builder_ref : public string_builder_base<non_owning_storage<Container>> {
+public:
+  simdjson_inline explicit string_builder_ref(Container &c)
+    : string_builder_base<non_owning_storage<Container>>(c) {}
 };
 
 
